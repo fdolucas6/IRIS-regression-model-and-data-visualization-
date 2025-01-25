@@ -1,0 +1,199 @@
+!pip install scikit-fda
+
+import os
+import numpy as np
+import nibabel as nib
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+from skimage import exposure
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, UpSampling2D, concatenate
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.losses import BinaryCrossentropy
+from tensorflow.keras.metrics import MeanIoU
+from skfda.ml.clustering import FuzzyCMeans, KMeans
+import cv2
+
+
+# --- Step 1: Data Preprocessing ---
+def load_and_preprocess_data(data_path, mask_path, img_size=(128, 128), sample_limit=50):
+    """Load and preprocess a subset of the LiTS17 dataset."""
+    images, masks = [], []
+
+    data_files = sorted(os.listdir(data_path))[:sample_limit]
+    mask_files = sorted(os.listdir(mask_path))[:sample_limit]
+
+    for img_file, mask_file in zip(data_files, mask_files):
+        img_nii = nib.load(os.path.join(data_path, img_file))
+        mask_nii = nib.load(os.path.join(mask_path, mask_file))
+
+        img_data = img_nii.get_fdata()
+        mask_data = mask_nii.get_fdata()
+
+        for slice_idx in range(img_data.shape[2]):
+            img_slice = cv2.resize(img_data[:, :, slice_idx], img_size)
+            mask_slice = cv2.resize(mask_data[:, :, slice_idx], img_size)
+
+            img_slice = MinMaxScaler().fit_transform(img_slice)
+            img_slice = exposure.equalize_hist(img_slice)
+            mask_slice = (mask_slice > 0).astype(np.float32)
+
+            images.append(img_slice)
+            masks.append(mask_slice)
+
+    return np.array(images), np.array(masks)
+
+# --- Step 2: Model Development ---
+def build_unet(input_shape):
+    """Build a U-Net model."""
+    inputs = Input(shape=input_shape)
+
+    # Encoder
+    conv1 = Conv2D(64, (3, 3), activation='relu', padding='same')(inputs)
+    pool1 = MaxPooling2D(pool_size=(2, 2))(conv1)
+
+    conv2 = Conv2D(128, (3, 3), activation='relu', padding='same')(pool1)
+    pool2 = MaxPooling2D(pool_size=(2, 2))(conv2)
+
+    # Bottleneck
+    conv3 = Conv2D(256, (3, 3), activation='relu', padding='same')(pool2)
+
+    # Decoder
+    up1 = UpSampling2D(size=(2, 2))(conv3)
+    conv4 = Conv2D(128, (3, 3), activation='relu', padding='same')(up1)
+
+    up2 = UpSampling2D(size=(2, 2))(conv4)
+    conv5 = Conv2D(64, (3, 3), activation='relu', padding='same')(up2)
+
+    # Output
+    outputs = Conv2D(1, (1, 1), activation='sigmoid')(conv5)
+
+    model = Model(inputs, outputs)
+    return model
+
+# --- Step 3: Training and Evaluation ---
+def train_model(model, train_images, train_masks, val_images, val_masks, epochs=2, batch_size=8):
+    """Compile and train the U-Net model."""
+    model.compile(optimizer=Adam(learning_rate=1e-4),
+                  loss=BinaryCrossentropy(),
+                  metrics=[MeanIoU(num_classes=2)])
+
+    history = model.fit(
+        train_images, train_masks,
+        validation_data=(val_images, val_masks),
+        epochs=epochs,
+        batch_size=batch_size
+    )
+    return history
+
+# --- Step 4: Post-Processing ---
+def apply_fcm(segmented_prob_map, n_clusters=3):
+    """Apply Fuzzy C-Means clustering to refine segmentation."""
+    pixels = segmented_prob_map.reshape(-1, 1)
+    fcm = FuzzyCMeans(n_clusters=n_clusters)
+    fcm.fit(pixels)
+    labels = fcm.predict(pixels)
+    refined_segmentation = labels.reshape(segmented_prob_map.shape)
+    return refined_segmentation
+
+# --- Step 5: Visualization ---
+def visualize_results(original_image, ground_truth, predicted_mask):
+    """Visualize original, ground truth, and predicted masks."""
+    plt.figure(figsize=(15, 5))
+
+    # Original Image
+    plt.subplot(1, 3, 1)
+    plt.title("Original Image")
+    plt.imshow(original_image, cmap='gray')
+    plt.axis('off')
+
+    # Ground Truth
+    plt.subplot(1, 3, 2)
+    plt.title("Ground Truth")
+    plt.imshow(ground_truth, cmap='gray')
+    plt.axis('off')
+
+    # Predicted Mask
+    plt.subplot(1, 3, 3)
+    plt.title("Predicted Mask")
+    plt.imshow(predicted_mask, cmap='viridis')
+    plt.axis('off')
+
+    plt.show()
+
+# --- Main Execution ---
+# Paths to data (Kaggle-specific paths)
+data_path = "/kaggle/input/litstrain-val/LiTS(train_test)/train_CT"  # Replace with your dataset's image directory
+mask_path = "/kaggle/input/litstrain-val/LiTS(train_test)/train_mask"  # Replace with your dataset's mask directory
+
+# Load and preprocess data
+images, masks = load_and_preprocess_data(data_path, mask_path, sample_limit=20)
+
+
+
+# Split into training and validation sets
+train_images, val_images, train_masks, val_masks = train_test_split(
+    images, masks, test_size=0.2, random_state=42
+)
+
+# Add channel dimension
+train_images = np.expand_dims(train_images, axis=-1)
+val_images = np.expand_dims(val_images, axis=-1)
+train_masks = np.expand_dims(train_masks, axis=-1)
+val_masks = np.expand_dims(val_masks, axis=-1)
+
+# Build the model
+unet_model = build_unet(input_shape=(128, 128, 1))
+unet_model.summary()
+
+# Train the model
+history = train_model(unet_model, train_images, train_masks, val_images, val_masks)
+
+# Evaluate and visualize results
+sample_image = val_images[0].squeeze()
+sample_mask = val_masks[0].squeeze()
+predicted_prob_map = unet_model.predict(np.expand_dims(sample_image, axis=(0, -1))).squeeze()
+
+def initialize_membership_matrix(n_samples, n_clusters):
+    U = np.random.rand(n_samples, n_clusters)
+    U = U / np.sum(U, axis=1, keepdims=True)
+    return U
+
+def update_centroids(data, U, m):
+    um = U ** m
+    centroids = np.dot(um.T, data) / np.sum(um.T, axis=1, keepdims=True)
+    return centroids
+
+def update_membership(data, centroids, m):
+    n_samples, n_clusters = data.shape[0], centroids.shape[0]
+    U = np.zeros((n_samples, n_clusters))
+    for i in range(n_samples):
+        for j in range(n_clusters):
+            denom = sum((np.linalg.norm(data[i] - centroids[j]) /
+                         np.linalg.norm(data[i] - centroids[k])) ** (2 / (m - 1))
+                        for k in range(n_clusters))
+            U[i, j] = 1 / denom
+    return U
+
+def fuzzy_c_means(data, n_clusters=3, m=2, max_iter=100, epsilon=1e-5):
+    n_samples = data.shape[0]
+    U = initialize_membership_matrix(n_samples, n_clusters)
+    for _ in range(max_iter):
+        centroids = update_centroids(data, U, m)
+        U_new = update_membership(data, centroids, m)
+        if np.linalg.norm(U_new - U) < epsilon:
+            break
+        U = U_new
+    labels = np.argmax(U, axis=1)
+    return labels, centroids, U
+
+def apply_fcm(segmented_prob_map, n_clusters=3):
+    pixels = segmented_prob_map.reshape(-1, 1)
+    labels, _, _ = fuzzy_c_means(pixels, n_clusters=n_clusters)
+    refined_segmentation = labels.reshape(segmented_prob_map.shape)
+    return refined_segmentation
+
+refined_mask = apply_fcm(predicted_prob_map)
+
+visualize_results(sample_image, sample_mask, refined_mask)
